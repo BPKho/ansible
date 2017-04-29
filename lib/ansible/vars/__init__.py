@@ -202,6 +202,218 @@ class VariableManager:
 
         return data
 
+    def get_var(self, var_name, loader, play=None, host=None, task=None, include_hostvars=True, include_delegate_to=True, use_cache=True):
+
+        if var_name == 'vars':
+            return self.get_vars(
+                loader=loader,
+                play=play,
+                host=host,
+                task=task,
+                include_hostvars=include_hostvars,
+                include_delegate_to=include_delegate_to,
+                use_cache=use_cache,
+            )
+        elif var_name == 'ansible_delegated_vars':
+            # if we have a task and we're delegating to another host, figure out the
+            # variables for that host now so we don't have to rely on hostvars later
+            if task and task.delegate_to is not None and include_delegate_to:
+                return self._get_delegated_vars(loader, play, task, all_vars)
+            else:
+                raise AnsibleError("can't get delegated variables without having a task in the context")
+        elif var_name == 'environment':
+            # special case for the 'environment' magic variable, as someone
+            # may have set it as a variable and we don't want to stomp on it
+            if task:
+                task.environment
+            else:
+                raise AnsibleError("can't get the environment variable without having a task in the context")
+
+        magic_variables = self._get_magic_variables(
+            loader=loader,
+            play=play,
+            host=host,
+            task=task,
+            include_hostvars=include_hostvars,
+            include_delegate_to=include_delegate_to,
+        )
+
+        if var_name in magic_variables:
+            return magic_variables[var_name]
+
+        if var_name in self._extra_vars:
+            return self._extra_vars[var_name]
+
+        # next, we check in role params and task include params
+        if task:
+            # special case for include tasks, where the include params
+            # may be specified in the vars field for the task, which should
+            # have higher precedence than the vars/np facts below
+            task_include_params = task.get_include_params()
+            if var_name in task_include_params:
+                return task_include_params[var_name]
+
+            if task._role:
+                task_role_params = task._role.get_role_params(reversed(task.get_dep_chain()))
+                if var_name in task_role_params:
+                    return task_role_params[var_name]
+
+        # next, we check nonpersistent facts and  the vars cache (include vars)
+        if host:
+            np_facts = self._nonpersistent_fact_cache.get(host.name, dict())
+            if var_name in np_facts:
+                return np_facts[var_name]
+
+            vars_cache = self._vars_cache.get(host.get_name(), dict())
+            if var_name in vars_cache:
+                return vars_cache[var_name]
+
+        # next, we check the tasks vars (which will look at parent blocks/task includes, and then
+        # we check the vars from the role, which will specifically follow the role dependency chain
+        if task:
+            task_vars = task.get_vars()
+            if var_name in task_vars:
+                return task_vars[var_name]
+
+            if task._role:
+                task_role_vars = task._role.get_vars(reversed(task.get_dep_chain()), include_params=False)
+                if var_name in task_role_vars:
+                    return task_role_vars[var_name]
+
+        #------------------------------------------------------------------------------------------
+
+        if play:
+            # By default, we now merge in all vars from all roles in the play,
+            # unless the user has disabled this via a config option
+            if not C.DEFAULT_PRIVATE_ROLE_VARS:
+                for role in reversed(play.get_roles()):
+                    role_vars = role.get_vars(include_params=False)
+                    if var_name in role_vars:
+                        return role_vars[var_name]
+
+            #for vars_file_item in reversed(play.get_vars_files()):
+            #    # create a set of temporary vars here, which incorporate the extra
+            #    # and magic vars so we can properly template the vars_files entries
+            #    temp_vars = combine_vars(all_vars, self._extra_vars)
+            #    temp_vars = combine_vars(temp_vars, magic_variables)
+            #    templar = Templar(loader=loader, variables=temp_vars)
+
+            #    # we assume each item in the list is itself a list, as we
+            #    # support "conditional includes" for vars_files, which mimics
+            #    # the with_first_found mechanism.
+            #    vars_file_list = vars_file_item
+            #    if not isinstance(vars_file_list, list):
+            #        vars_file_list = [ vars_file_list ]
+
+            #    # now we iterate through the (potential) files, and break out
+            #    # as soon as we read one from the list. If none are found, we
+            #    # raise an error, which is silently ignored at this point.
+            #    try:
+            #        for vars_file in vars_file_list:
+            #            vars_file = templar.template(vars_file)
+            #            try:
+            #                data = preprocess_vars(loader.load_from_file(vars_file))
+            #                if data is not None:
+            #                    for item in data:
+            #                        all_vars = combine_vars(all_vars, item)
+            #                break
+            #            except AnsibleFileNotFound:
+            #                # we continue on loader failures
+            #                continue
+            #            except AnsibleParserError:
+            #                raise
+            #        else:
+            #            # if include_delegate_to is set to False, we ignore the missing
+            #            # vars file here because we're working on a delegated host
+            #            if include_delegate_to:
+            #                raise AnsibleFileNotFound("vars file %s was not found" % vars_file_item)
+            #    except (UndefinedError, AnsibleUndefinedVariable):
+            #        if host is not None and self._fact_cache.get(host.name, dict()).get('module_setup') and task is not None:
+            #            raise AnsibleUndefinedVariable("an undefined variable was found when attempting to template the vars_files item '%s'" % vars_file_item,
+            #                                           obj=vars_file_item)
+            #        else:
+            #            # we do not have a full context here, and the missing variable could be
+            #            # because of that, so just show a warning and continue
+            #            display.vvv("skipping vars_file '%s' due to an undefined variable" % vars_file_item)
+            #            continue
+
+            play_vars = play.get_vars()
+            if var_name in play_vars:
+                return play_vars[var_name]
+
+            #-----------------------------------------------------------------------------
+
+        #>>>>
+
+        if host:
+            # finally, the facts caches for this host, if it exists
+            try:
+                host_facts = wrap_var(self._fact_cache.get(host.name, dict()))
+                if C.NAMESPACE_FACTS:
+                    host_facts = {'ansible_facts': host_facts}
+                if var_name in host_facts:
+                    return host_facts[var_name]
+            except KeyError:
+                pass
+
+            # then we merge in the host_vars/<hostname> file, if it exists
+            host_name = host.get_name()
+            if host_name in self._host_vars_files:
+                for data in reversed(self._host_vars_files[host_name]):
+                    data = preprocess_vars(data)
+                    for item in reversed(data):
+                        if var_name in item:
+                            return item[var_name]
+
+            # then we merge in vars from the host specified in the inventory (INI or script)
+            host_vars = host.get_vars()
+            if var_name in host_vars:
+                return host_vars[var_name]
+
+            for group in reversed(sorted(host.get_groups(), key=lambda g: (g.depth, g.priority, g.name))):
+                if group.name in self._group_vars_files and group.name != 'all':
+                    for data in reversed(self._group_vars_files[group.name]):
+                        data = preprocess_vars(data)
+                        for item in reversed(data):
+                            if var_name in item:
+                                return item[var_name]
+
+            # these are PLAY host/group vars, inventory adjacent ones have already been processed
+            # next, we load any vars from group_vars files and then any vars from host_vars
+            # files which may apply to this host or the groups it belongs to. We merge in the
+            # special 'all' group_vars first, if they exist
+            if 'all' in self._group_vars_files:
+                data = preprocess_vars(self._group_vars_files['all'])
+                for item in reversed(data):
+                    if var_name in item:
+                        return item[var_name]
+
+            # first we merge in vars from groups specified in the inventory (INI or script)
+            host_group_vars = host.get_group_vars()
+            if var_name in host_group_vars:
+                return host_group_vars[var_name]
+
+        # if we have a task in this context, and that task has a role, make
+        # sure it sees its defaults above any other roles, as we previously
+        # (v1) made sure each task had a copy of its roles default vars
+        if task and task._role is not None and (play or task.action == 'include_role'):
+            task_role_defaults = task._role.get_default_vars(dep_chain=task.get_dep_chain())
+            if var_name in task_role_defaults:
+                return task_role_defaults[var_name]
+
+        # vars specified in defaults/main.yml for all roles within the specified play
+        if play:
+            play_roles = play.get_roles()
+            for role in reversed(play.get_roles()):
+                role_default_vars = role.get_default_vars()
+                if var_name in role_default_vars:
+                    return role_default_vars[var_name]
+                all_vars = combine_vars(all_vars, role.get_default_vars())
+
+
+
+
+
     def get_vars(self, loader, play=None, host=None, task=None, include_hostvars=True, include_delegate_to=True, use_cache=True):
         '''
         Returns the variables, with optional "context" given via the parameters
